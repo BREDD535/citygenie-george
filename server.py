@@ -11,6 +11,23 @@ app = FastAPI(title="CityGenie George")
 
 CACHE_MINUTES = 15
 
+# VERIFY YEARLY: https://www.george.gov.za/refuse-removal/
+REFUSE_SCHEDULE = {
+    "Monday": ["Heatherlands", "Denneoord", "Fernridge"],
+    "Tuesday": ["Blanco", "Heather Park", "Camphersdrift"],
+    "Wednesday": ["George Central", "Dormehlsdrift", "Glen Barrie"],
+    "Thursday": ["Thembalethu", "Lawaaikamp", "Borcherds"],
+    "Friday": ["Pacaltsdorp", "Delville Park", "Andersonville"],
+    "Saturday": ["Leisure Isle", "Wilderness"]
+}
+
+# SAFE: Generic contacts. For ward-specific names, check https://www.george.gov.za/council/ward-councillors
+COUNCILLORS = {
+    "General": {"name": "George Municipality", "phone": "044 801 9111", "area": "Switchboard - ask for your ward councillor"},
+    "WhatsApp": {"name": "Municipal WhatsApp", "phone": "044 803 5555", "area": "Report service issues 24/7"},
+    "After Hours": {"name": "Emergency Standby", "phone": "044 801 6300", "area": "Water & electricity emergencies only"},
+}
+
 def cache_expired(cached_time):
     return datetime.now() - cached_time > timedelta(minutes=CACHE_MINUTES)
 
@@ -22,63 +39,14 @@ def get_cached_data():
         "notices": fetch_notices(),
         "disruptions": fetch_live_disruptions(),
         "weather": fetch_weather_alerts(),
-        "events": fetch_live_events()
+        "events": fetch_live_events(),
+        "bus_alerts": fetch_bus_alerts(),
+        "water_restrictions": fetch_water_restrictions(),
+        "refuse": REFUSE_SCHEDULE
     }
 
 def get_data():
     data = get_cached_data()
     if cache_expired(data["time"]):
         get_cached_data.cache_clear()
-        data = get_cached_data()
-    return data
-
-def fetch_dam_level():
-    try:
-        r = requests.get("https://www.george.gov.za/", timeout=5)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        text = soup.get_text()
-        match = re.search(r'Garden Route Dam.*?(\d+[\.,]?\d*%)', text, re.IGNORECASE)
-        return match.group(1) if match else "67%"
-    except:
-        return "67%"
-
-def fetch_notices():
-    try:
-        r = requests.get("https://www.george.gov.za/category/notices/", timeout=5)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        notices = []
-        for item in soup.select('h2.entry-title a, h3')[:5]:
-            title = item.get_text(strip=True)
-            if title and len(title) > 10: 
-                notices.append(title)
-        return notices if notices else ["No current notices"]
-    except:
-        return ["Unable to load notices"]
-
-def fetch_live_disruptions():
-    disruptions = []
-    six_hours_ago = datetime.now() - timedelta(hours=6)
-    twenty_four_hours_ago = datetime.now() - timedelta(hours=24)
-    
-    fb_rss = os.getenv("FB_RSS_URL", "")
-    if fb_rss:
-        try:
-            r = requests.get(fb_rss, timeout=5)
-            soup = BeautifulSoup(r.content, 'xml')
-            for item in soup.find_all('item'):
-                title = item.title.text if item.title else ""
-                desc = item.description.text if item.description else ""
-                pub_date_str = item.pubDate.text
-                pub_date = datetime.strptime(pub_date_str, "%a, %d %b %Y %H:%M:%S %z").replace(tzinfo=None)
-                
-                combined = (title + " " + desc).lower()
-                
-                power_words = ['unplanned outage','power outage','electricity','no power','substation','krag','onderbreking','load','tripped','fault','outage','beurtkrag']
-                water_words = ['burst pipe','water outage','no water','reservoir','supply interruption','water','pyp','gebars','lek']
-                traffic_words = ['road closure','accident','n2','n12','traffic','collision','closure','pad','botsing']
-                
-                if pub_date > twenty_four_hours_ago:
-                    if any(x in combined for x in power_words):
-                        disruptions.append({"type": "Power", "msg": title[:120], "time": pub_date.strftime("%H:%M")})
-                    elif any(x in combined for x in water_words):
-                        disruptions.append({"type": "
+        data = get_cached_data
