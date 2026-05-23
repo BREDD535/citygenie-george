@@ -2,5 +2,3 @@ fastapi
 uvicorn
 requests
 beautifulsoup4
-pandas
-openpyxl
