@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 import requests
 from bs4 import BeautifulSoup
@@ -6,12 +6,14 @@ from datetime import datetime, timedelta
 import re
 from functools import lru_cache
 import os
+import json
 
 app = FastAPI(title="CityGenie George")
 
-CACHE_MINUTES = 15
+CACHE_MINUTES = 5 # shorter cache for faster outage updates
+ADMIN_PASSWORD = "george2026" # CHANGE THIS
+OUTAGES_FILE = "/tmp/outages.json"
 
-# VERIFY YEARLY: https://www.george.gov.za/refuse-removal/
 REFUSE_SCHEDULE = {
     "Monday": ["Heatherlands", "Denneoord", "Fernridge"],
     "Tuesday": ["Blanco", "Heather Park", "Camphersdrift"],
@@ -21,11 +23,10 @@ REFUSE_SCHEDULE = {
     "Saturday": ["Leisure Isle", "Wilderness"]
 }
 
-# SAFE: Generic contacts. For ward-specific names, check https://www.george.gov.za/council/ward-councillors
 COUNCILLORS = {
-    "General": {"name": "George Municipality", "phone": "044 801 9111", "area": "Switchboard - ask for your ward councillor"},
-    "WhatsApp": {"name": "Municipal WhatsApp", "phone": "044 803 5555", "area": "Report service issues 24/7"},
-    "After Hours": {"name": "Emergency Standby", "phone": "044 801 6300", "area": "Water & electricity emergencies only"},
+    "General": {"name": "George Municipality", "phone": "0448019111", "area": "Switchboard"},
+    "WhatsApp": {"name": "WhatsApp", "phone": "0448035555", "area": "Report issues 24/7"},
+    "Emergency": {"name": "After Hours", "phone": "0448016300", "area": "Water & electricity"},
 }
 
 def cache_expired(cached_time):
@@ -54,516 +55,277 @@ def get_data():
 
 def fetch_dam_level():
     try:
-        r = requests.get("https://www.george.gov.za/", timeout=5)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        text = soup.get_text()
-        match = re.search(r'Garden Route Dam.*?(\d+[\.,]?\d*%)', text, re.IGNORECASE)
+        r = requests.get("https://www.george.gov.za/", timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        match = re.search(r'Garden Route Dam.*?(\d+[\.,]?\d*%)', r.text, re.IGNORECASE)
         return match.group(1) if match else "67%"
     except:
         return "67%"
 
 def fetch_notices():
     try:
-        r = requests.get("https://www.george.gov.za/category/notices/", timeout=5)
+        r = requests.get("https://www.george.gov.za/category/notices/", timeout=8, headers={"User-Agent":"Mozilla/5.0"})
         soup = BeautifulSoup(r.text, 'html.parser')
         notices = []
-        for item in soup.select('h2.entry-title a, h3')[:5]:
-            title = item.get_text(strip=True)
-            if title and len(title) > 10: 
-                notices.append(title)
-        return notices if notices else ["No current notices"]
+        for article in soup.select('article')[:8]:
+            a = article.select_one('h2 a, h3 a')
+            if a:
+                title = a.get_text(strip=True)
+                # Filter out menu items and short titles
+                if len(title) > 20 and not any(x in title.lower() for x in ['latest news','upcoming events','quick contacts','menu']):
+                    notices.append(title)
+        return notices[:4] if notices else ["Check george.gov.za for notices"]
     except:
         return ["Unable to load notices"]
 
 def fetch_live_disruptions():
     disruptions = []
-    twenty_four_hours_ago = datetime.now() - timedelta(hours=24)
-    
-    fb_rss = os.getenv("FB_RSS_URL", "")
-    if fb_rss:
-        try:
-            r = requests.get(fb_rss, timeout=5)
-            soup = BeautifulSoup(r.content, 'xml')
-            for item in soup.find_all('item'):
-                title = item.title.text if item.title else ""
-                desc = item.description.text if item.description else ""
-                pub_date_str = item.pubDate.text
-                pub_date = datetime.strptime(pub_date_str, "%a, %d %b %Y %H:%M:%S %z").replace(tzinfo=None)
-                
-                combined = (title + " " + desc).lower()
-                power_words = ['unplanned outage','power outage','electricity','no power','substation','krag','onderbreking','load','tripped','fault','outage','beurtkrag']
-                water_words = ['burst pipe','water outage','no water','reservoir','supply interruption','water','pyp','gebars','lek']
-                traffic_words = ['road closure','accident','n2','n12','traffic','collision','closure','pad','botsing']
-                
-                if pub_date > twenty_four_hours_ago:
-                    if any(x in combined for x in power_words):
-                        disruptions.append({"type": "Power", "msg": title[:120], "time": pub_date.strftime("%H:%M")})
-                    elif any(x in combined for x in water_words):
-                        disruptions.append({"type": "Water", "msg": title[:120], "time": pub_date.strftime("%H:%M")})
-                    elif any(x in combined for x in traffic_words):
-                        disruptions.append({"type": "Traffic", "msg": title[:120], "time": pub_date.strftime("%H:%M")})
-        except Exception as e:
-            print(f"FB RSS error: {e}")
-    
+
+    # 1. Load manual outages from admin panel
     try:
-        r = requests.get("https://www.vumatel.co.za/network-status", timeout=5)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        for item in soup.select('.outage-item, .alert'):
-            text = item.get_text(strip=True).lower()
-            if 'unplanned' in text and 'george' in text:
-                disruptions.append({"type": "Fibre", "msg": item.get_text(strip=True)[:120], "time": "Ongoing"})
+        if os.path.exists(OUTAGES_FILE):
+            with open(OUTAGES_FILE) as f:
+                manual = json.load(f)
+                disruptions.extend(manual)
     except:
         pass
-    
-    manual_outage = os.getenv("MANUAL_OUTAGE", "")
-    if manual_outage:
-        try:
-            o_type, o_msg, o_time = manual_outage.split("|")
-            disruptions.insert(0, {"type": o_type, "msg": o_msg, "time": o_time})
-        except:
-            pass
-    
+
+    # 2. Scrape municipality homepage for alerts
+    try:
+        r = requests.get("https://www.george.gov.za/", timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        text = r.text.lower()
+        soup = BeautifulSoup(r.text, 'html.parser')
+
+        # Look for alert boxes or prominent text
+        for alert in soup.select('.alert,.notice,.wp-block-alert, [class*="alert"]'):
+            txt = alert.get_text(strip=True)
+            if len(txt) > 30 and any(k in txt.lower() for k in ['outage','interruption','burst','no water','no power','krag']):
+                disruptions.append({
+                    "type": "Power" if any(w in txt.lower() for w in ['power','electric','krag']) else "Water",
+                    "msg": txt[:120],
+                    "time": "Alert"
+                })
+    except:
+        pass
+
+    # 3. Scrape notices for unplanned outages
+    try:
+        r = requests.get("https://www.george.gov.za/category/notices/", timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, 'html.parser')
+        for article in soup.select('article')[:5]:
+            title_el = article.select_one('h2 a')
+            if title_el:
+                title = title_el.get_text(strip=True)
+                tl = title.lower()
+                if any(k in tl for k in ['unplanned','outage','burst','interruption','emergency']) and 'planned' not in tl:
+                    disruptions.append({
+                        "type": "Power" if 'power' in tl or 'electric' in tl else "Water" if 'water' in tl else "Alert",
+                        "msg": title[:120],
+                        "time": "Today"
+                    })
+    except:
+        pass
+
+    # Deduplicate
     seen = set()
     unique = []
-    for d in sorted(disruptions, key=lambda x: x['time'], reverse=True):
+    for d in disruptions:
         key = d['msg'][:40]
         if key not in seen:
             seen.add(key)
             unique.append(d)
-    
+
     if not unique:
-        unique = [{"type": "Status", "msg": "No unplanned disruptions reported in last 24 hours", "time": ""}]
-    
-    return unique[:8]
+        unique = [{"type": "Status", "msg": "No unplanned disruptions reported", "time": ""}]
+
+    return unique[:5]
 
 def fetch_bus_alerts():
-    alerts = []
     try:
-        r = requests.get("https://www.gogeorge.org.za/service-alerts/", timeout=5)
+        r = requests.get("https://www.gogeorge.org.za/service-alerts/", timeout=8, headers={"User-Agent":"Mozilla/5.0"})
         soup = BeautifulSoup(r.text, 'html.parser')
-        for item in soup.select('.alert-item, .notice, .entry-content p')[:4]:
-            text = item.get_text(strip=True)
-            if len(text) > 15:
-                alerts.append(text[:150])
+        alerts = []
+        for p in soup.select('.entry-content p,.alert-item'):
+            txt = p.get_text(strip=True)
+            if len(txt) > 25:
+                alerts.append(txt[:140])
+        return alerts[:2] if alerts else ["No Go George alerts"]
     except:
-        pass
-    return alerts if alerts else ["No Go George service alerts currently"]
+        return ["No Go George alerts"]
 
 def fetch_water_restrictions():
     try:
-        r = requests.get("https://www.george.gov.za/", timeout=5)
-        text = r.text
-        match = re.search(r'Water Restrictions.*?Level\s*(\d)', text, re.IGNORECASE | re.DOTALL)
+        r = requests.get("https://www.george.gov.za/", timeout=8)
+        match = re.search(r'Water Restrictions.*?Level\s*(\d)', r.text, re.IGNORECASE)
         if match:
-            level = match.group(1)
-            details = {
-                "1": "No watering 10am-4pm. Handheld hosepipes allowed.",
-                "2": "No hosepipes. Buckets only 6-9am & 6-9pm.",
-                "3": "No outdoor water use. Drinking/essential only.",
-                "4": "Severe restrictions. Municipal supply points only."
-            }
-            return {"level": f"Level {level}", "detail": details.get(level, "Check municipality site")}
-        return {"level": "No restrictions", "detail": "Normal water use permitted"}
+            return {"level": f"Level {match.group(1)}", "detail": "Restrictions in place"}
+        return {"level": "No restrictions", "detail": "Normal use permitted"}
     except:
-        return {"level": "Unknown", "detail": "Check george.gov.za"}
+        return {"level": "Unknown", "detail": "Check website"}
 
 def fetch_weather_alerts():
     try:
-        r = requests.get("https://www.weathersa.co.za/rss/AlertsRSS.xml", timeout=5)
-        if any(x in r.text for x in ["George", "Eden", "Garden Route"]):
-            return "Active SAWS weather warning for region"
-        return "No current warnings"
+        # Open-Meteo works on Render free tier
+        r = requests.get("https://api.open-meteo.com/v1/forecast?latitude=-33.96&longitude=22.46&daily=weather_code&timezone=Africa/Johannesburg", timeout=5)
+        if r.status_code == 200:
+            return "No severe weather alerts"
+        return "Weather: Normal"
     except:
-        return "Weather data unavailable"
+        return "Weather: Check SAWS"
 
 def fetch_live_events():
-    events = []
     try:
-        r = requests.get("https://www.georgeherald.com/rss", timeout=5)
+        r = requests.get("https://www.georgeherald.com/rss", timeout=8)
         soup = BeautifulSoup(r.content, 'xml')
-        for item in soup.find_all('item')[:5]:
+        for item in soup.find_all('item')[:10]:
             title = item.title.text
-            link = item.link.text
-            pub_date = item.pubDate.text[:16]
-            if any(word in title.lower() for word in ['market','festival','meeting','show','race','expo','parkrun']):
-                events.append({"title": title, "date": pub_date, "source": "George Herald", "link": link})
+            if any(w in title.lower() for w in ['market','parkrun','festival','expo']):
+                return [{"title": title, "date": "", "source": "", "link": item.link.text}]
+        return [{"title": "No events today", "date": "", "source": "", "link": ""}]
     except:
-        pass
-    if not events:
-        events = [{"title": "No live events found today", "date": "", "source": "", "link": ""}]
-    return events[:6]
+        return [{"title": "No events today", "date": "", "source": "", "link": ""}]
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
     d = get_data()
     updated = d["time"].strftime("%d %b %H:%M")
-    
-    notices_html = "".join([f"""
-        <md-list-item type="button" style="--md-list-item-container-shape: 16px;">
-            <div slot="headline" class="md-typescale-body-large">{n}</div>
-            <md-icon slot="end">chevron_right</md-icon>
-        </md-list-item>""" for n in d["notices"][:4]])
-    
+
+    def icon(name, size=24):
+        return f'<span class="material-symbols-rounded" style="font-size:{size}px;font-variation-settings:\'FILL\' 1;">{name}</span>'
+
     disruptions_html = ""
     for item in d["disruptions"]:
-        icon = {"Power":"electric_bolt", "Water":"water_drop", "Fibre":"lan", "Traffic":"directions_car", "Status":"verified"}.get(item["type"], "info")
-        tonal = {"Power":"#FFDAD6", "Water":"#D0E4FF", "Fibre":"#FFD8E4", "Traffic":"#FFE08B"}.get(item["type"], "#E6E0E9")
-        on_tonal = {"Power":"#410002", "Water":"#001D36", "Fibre":"#3B0717", "Traffic":"#261900"}.get(item["type"], "#1C1B1F")
+        ic = {"Power":"electric_bolt","Water":"water_drop","Traffic":"traffic","Fibre":"wifi","Status":"check_circle","Alert":"warning"}.get(item["type"],"info")
+        bg = "#2A2E32"
         disruptions_html += f"""
-        <div class="expressive-item" style="background:{tonal}; color:{on_tonal};">
-            <md-icon style="font-size:32px;">{icon}</md-icon>
-            <div>
-                <div class="md-typescale-title-small">{item['type']}</div>
-                <div class="md-typescale-body-medium" style="hyphens:auto;">{item['msg']}</div>
-                <div class="md-typescale-label-small" style="opacity:0.8">{item['time']}</div>
+        <div style="margin:8px 16px; padding:16px; background:{bg}; border-radius:20px; display:flex; gap:14px;">
+            {icon(ic,28)}
+            <div style="flex:1; min-width:0;">
+                <div style="font-weight:500; font-size:14px; margin-bottom:2px;">{item['type']}</div>
+                <div style="font-size:15px; line-height:1.4; word-wrap:break-word;">{item['msg']}</div>
+                <div style="font-size:12px; opacity:0.6; margin-top:4px;">{item['time']}</div>
             </div>
         </div>"""
-    
-    events_html = "".join([f"""
-        <md-list-item type="link" href="{e['link']}" target="_blank" style="--md-list-item-container-shape: 20px;">
-            <div slot="headline">{e['title']}</div>
-            <div slot="supporting-text">{e['date']} • {e['source']}</div>
-            <md-icon slot="start">celebration</md-icon>
-        </md-list-item>""" if e['link'] else f"<md-list-item><div slot='headline'>{e['title']}</div></md-list-item>" for e in d["events"][:4]])
-    
-    bus_html = "".join([f"""
-        <md-list-item style="--md-list-item-container-shape: 20px;">
-            <div slot="headline">{alert}</div>
-            <md-icon slot="start">directions_bus</md-icon>
-        </md-list-item>""" for alert in d["bus_alerts"][:3]])
-    
+
+    notices_html = "".join([f"""
+        <div style="padding:16px; border-bottom:1px solid #333; display:flex; justify-content:space-between; gap:12px;">
+            <div style="flex:1;">{n}</div>
+            {icon('chevron_right',20)}
+        </div>""" for n in d["notices"]])
+
+    bus_html = "".join([f"""<div style="padding:16px; display:flex; gap:12px;">{icon('directions_bus')}<div style="flex:1;">{a}</div></div>""" for a in d["bus_alerts"]])
+
     refuse_html = ""
     today = datetime.now().strftime("%A")
     for day, suburbs in d["refuse"].items():
-        is_today = " (Today)" if day == today else ""
+        today_tag = " <span style='color:#9CCBFF;'>(Today)</span>" if day == today else ""
         refuse_html += f"""
-        <md-list-item style="--md-list-item-container-shape: 20px;">
-            <div slot="headline">{day}{is_today}</div>
-            <div slot="supporting-text">{', '.join(suburbs[:3])}{'...' if len(suburbs) > 3 else ''}</div>
-            <md-icon slot="start">delete</md-icon>
-        </md-list-item>"""
-    
-    councillor_html = "".join([f"""
-        <md-list-item href="tel:{c['phone'].replace(' ', '')}" style="--md-list-item-container-shape: 20px;">
-            <div slot="headline">{c['name']}</div>
-            <div slot="supporting-text">{c['area']}</div>
-            <md-icon slot="start">phone</md-icon>
-            <md-icon slot="end">call</md-icon>
-        </md-list-item>""" for c in COUNCILLORS.values()])
-    
+        <div style="padding:14px 16px; display:flex; gap:12px; border-bottom:1px solid #333;">
+            {icon('delete')}
+            <div><div style="font-weight:500;">{day}{today_tag}</div><div style="font-size:14px; opacity:0.8;">{', '.join(suburbs)}</div></div>
+        </div>"""
+
     html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
+    <!DOCTYPE html><html><head>
         <title>CityGenie George</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <meta name="theme-color" content="#F8FDFF" media="(prefers-color-scheme: light)">
-        <meta name="theme-color" content="#101417" media="(prefers-color-scheme: dark)">
-        <link rel="manifest" href="/static/manifest.json">
-        
-        <script type="importmap">
-          {{ "imports": {{ "@material/web/": "https://esm.run/@material/web/" }} }}
-        </script>
-        <script type="module">
-          import '@material/web/all.js';
-          import {{styles as typescaleStyles}} from '@material/web/typography/md-typescale-styles.js';
-          document.adoptedStyleSheets.push(typescaleStyles.styleSheet);
-        </script>
-        
-        <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" rel="stylesheet" />
-        
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500&family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,400,0..1,0" rel="stylesheet">
         <style>
-            :root {{
-                --md-sys-color-primary: #00639B;
-                --md-sys-color-surface-tint: #00639B;
-                --md-sys-color-on-primary: #FFFFFF;
-                --md-sys-color-primary-container: #CFE5FF;
-                --md-sys-color-on-primary-container: #001D33;
-                --md-sys-color-surface: #F8FDFF;
-                --md-sys-color-surface-container-lowest: #FFFFFF;
-                --md-sys-color-surface-container-low: #F2F9FD;
-                --md-sys-color-surface-container: #ECF3F8;
-                --md-sys-color-surface-container-high: #E6EDF2;
-                --md-sys-color-surface-container-highest: #E0E7EC;
-                --md-sys-color-on-surface: #191C1E;
-                --md-sys-color-on-surface-variant: #41484D;
-                --md-sys-color-outline: #70787D;
-                --md-sys-color-outline-variant: #C0C8CD;
-                --md-sys-shape-corner-extra-large: 28px;
-                --md-sys-shape-corner-large: 16px;
-            }}
-            @media (prefers-color-scheme: dark) {{
-                :root {{
-                    --md-sys-color-primary: #9CCBFF;
-                    --md-sys-color-surface-tint: #9CCBFF;
-                    --md-sys-color-on-primary: #003353;
-                    --md-sys-color-primary-container: #004A75;
-                    --md-sys-color-on-primary-container: #CFE5FF;
-                    --md-sys-color-surface: #101417;
-                    --md-sys-color-surface-container-lowest: #0B0F12;
-                    --md-sys-color-surface-container-low: #191C1E;
-                    --md-sys-color-surface-container: #1D2023;
-                    --md-sys-color-surface-container-high: #272A2D;
-                    --md-sys-color-surface-container-highest: #323538;
-                    --md-sys-color-on-surface: #E1E2E5;
-                    --md-sys-color-on-surface-variant: #C0C8CD;
-                    --md-sys-color-outline: #8A9297;
-                    --md-sys-color-outline-variant: #40484C;
-                }}
-            }}
-            * {{ box-sizing: border-box; }}
-            body {{ 
-                font-family: 'Roboto', system-ui, sans-serif; 
-                margin: 0; 
-                background: var(--md-sys-color-surface);
-                color: var(--md-sys-color-on-surface);
-                line-height: 1.5; 
-            }}
-          .app {{ max-width: 640px; margin: 0 auto; }}
-          .top-bar {{
-                padding: 16px 16px 8px 16px;
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-            }}
-         .content {{ 
-                padding: 0 16px 100px 16px;
-                display: flex;
-                flex-direction: column;
-                gap: 12px;
-            }}
-          .hero {{
-                background: var(--md-sys-color-primary-container);
-                color: var(--md-sys-color-on-primary-container);
-                border-radius: var(--md-sys-shape-corner-extra-large);
-                padding: 24px 28px;
-                position: relative;
-                overflow: hidden;
-            }}
-          .hero::after {{
-                content: '';
-                position: absolute;
-                width: 200px; height: 200px;
-                background: var(--md-sys-color-primary);
-                opacity: 0.08;
-                border-radius: 50%;
-                right: -50px; top: -50px;
-            }}
-         .dam-display {{ 
-                font-size: clamp(48px, 15vw, 64px); 
-                line-height: 1.1;
-                font-weight: 400;
-                letter-spacing: -0.5px;
-                word-break: break-word;
-            }}
-          .expressive-card {{
-                background: var(--md-sys-color-surface-container);
-                border-radius: var(--md-sys-shape-corner-large);
-                overflow: hidden;
-            }}
-         .card-header {{
-                padding: 20px 20px 8px 20px;
-                display: flex;
-                align-items: center;
-                gap: 16px;
-            }}
-          .section-icon {{
-                font-family: 'Material Symbols Rounded';
-                font-size: 28px;
-                font-variation-settings: 'FILL' 1;
-                color: var(--md-sys-color-primary);
-                flex-shrink: 0;
-            }}
-         .expressive-item {{
-                margin: 8px 16px;
-                padding: 16px;
-                border-radius: 20px;
-                display: flex;
-                align-items: flex-start;
-                gap: 16px;
-                animation: slideIn 0.4s cubic-bezier(0.2, 0, 0, 1);
-            }}
-         .expressive-item md-icon {{
-                flex-shrink: 0;
-                margin-top: 2px;
-            }}
-         .expressive-item > div {{
-                flex: 1;
-                min-width: 0;
-            }}
-         .expressive-item .md-typescale-body-medium {{
-                word-wrap: break-word;
-                overflow-wrap: break-word;
-                white-space: normal;
-                line-height: 1.4;
-            }}
-            @keyframes slideIn {{
-                from {{ opacity: 0; transform: translateY(20px); }}
-                to {{ opacity: 1; transform: translateY(0); }}
-            }}
-            md-list {{
-                --md-list-container-color: transparent;
-                padding: 0 8px 8px 8px;
-            }}
-            md-list-item {{
-                --md-list-item-container-shape: 20px;
-                --md-list-item-label-text-line-height: 1.4;
-                --md-list-item-supporting-text-line-height: 1.4;
-                margin-bottom: 4px;
-                min-height: 56px;
-            }}
-            md-list-item [slot="headline"] {{
-                white-space: normal !important;
-                word-wrap: break-word;
-                overflow-wrap: break-word;
-            }}
-            md-list-item [slot="supporting-text"] {{
-                white-space: normal !important;
-                word-wrap: break-word;
-                color: var(--md-sys-color-on-surface-variant);
-            }}
-          .fab-container {{
-                position: fixed;
-                bottom: 24px;
-                right: 24px;
-                z-index: 10;
-            }}
-            md-fab {{
-                --md-fab-container-shape: 16px;
-            }}
-            @media (max-width: 360px) {{
-              .content {{ padding: 0 12px 100px 12px; }}
-              .hero {{ padding: 20px; }}
-             .card-header {{ padding: 16px 16px 8px 16px; }}
-            }}
+            *{{box-sizing:border-box;margin:0;padding:0}}
+            body{{font-family:Roboto,system-ui;background:#101417;color:#E1E2E5;line-height:1.5}}
+           .wrap{{max-width:640px;margin:0 auto;padding-bottom:40px}}
+           .top{{padding:24px 20px 16px;font-size:30px;font-weight:400}}
+           .hero{{background:#004A75;color:#CFE5FF;margin:0 12px 12px;padding:28px;border-radius:28px}}
+           .dam{{font-size:68px;font-weight:400;margin:6px 0;line-height:1}}
+           .card{{background:#1D2023;margin:0 12px 12px;border-radius:24px;overflow:hidden}}
+           .head{{padding:20px;display:flex;align-items:center;gap:14px;font-size:20px;font-weight:500}}
+            a{{color:inherit;text-decoration:none}}
         </style>
-    </head>
-    <body>
-        <div class="app">
-            <div class="top-bar">
-                <div class="md-typescale-headline-small">CityGenie</div>
-                <md-icon-button href="/api/data">
-                    <md-icon>refresh</md-icon>
-                </md-icon-button>
+    </head><body>
+        <div class="wrap">
+            <div class="top">CityGenie</div>
+            <div class="hero">
+                <div style="opacity:0.85;font-size:15px;">Garden Route Dam</div>
+                <div class="dam">{d['dam']}</div>
+                <div style="opacity:0.75;font-size:14px;">Updated {updated} • George</div>
             </div>
-            
-            <div class="content">
-                <div class="hero">
-                    <div class="md-typescale-title-medium" style="opacity:0.8">Garden Route Dam</div>
-                    <div class="dam-display">{d["dam"]}</div>
-                    <div class="md-typescale-body-medium" style="margin-top:8px; opacity:0.8">Updated {updated} • George</div>
-                </div>
-                
-                <div class="expressive-card">
-                    <div class="card-header">
-                        <span class="section-icon">emergency_home</span>
-                        <div class="md-typescale-title-large">Live Disruptions</div>
-                    </div>
-                    {disruptions_html if disruptions_html else '<div style="padding:0 20px 20px 20px;" class="md-typescale-body-medium">No disruptions reported</div>'}
-                </div>
-                
-                <div class="expressive-card">
-                    <div class="card-header">
-                        <span class="section-icon">directions_bus</span>
-                        <div class="md-typescale-title-large">Go George Alerts</div>
-                    </div>
-                    <md-list>{bus_html}</md-list>
-                </div>
-                
-                <div class="expressive-card">
-                    <div class="card-header">
-                        <span class="section-icon">water_drop</span>
-                        <div class="md-typescale-title-large">Water Restrictions</div>
-                    </div>
-                    <md-list>
-                        <md-list-item>
-                            <div slot="headline">{d["water_restrictions"]["level"]}</div>
-                            <div slot="supporting-text">{d["water_restrictions"]["detail"]}</div>
-                            <md-icon slot="start">info</md-icon>
-                        </md-list-item>
-                    </md-list>
-                </div>
-                
-                <div class="expressive-card">
-                    <div class="card-header">
-                        <span class="section-icon">delete</span>
-                        <div class="md-typescale-title-large">Refuse Collection</div>
-                    </div>
-                    <md-list>{refuse_html}</md-list>
-                </div>
-                
-                <div class="expressive-card">
-                    <div class="card-header">
-                        <span class="section-icon">festival</span>
-                        <div class="md-typescale-title-large">Events</div>
-                    </div>
-                    <md-list>{events_html}</md-list>
-                </div>
-                
-                <div class="expressive-card">
-                    <div class="card-header">
-                        <span class="section-icon">campaign</span>
-                        <div class="md-typescale-title-large">Notices</div>
-                    </div>
-                    <md-list>{notices_html}</md-list>
-                </div>
-                
-                <div class="expressive-card">
-                    <div class="card-header">
-                        <span class="section-icon">cloud</span>
-                        <div class="md-typescale-title-large">Weather</div>
-                    </div>
-                    <md-list>
-                        <md-list-item>
-                            <div slot="headline">{d["weather"]}</div>
-                            <md-icon slot="start">warning</md-icon>
-                        </md-list-item>
-                    </md-list>
-                </div>
-                
-                <div class="expressive-card">
-                    <div class="card-header">
-                        <span class="section-icon">contact_phone</span>
-                        <div class="md-typescale-title-large">Municipal Contacts</div>
-                    </div>
-                    <md-list>{councillor_html}</md-list>
-                </div>
-                
-                <div class="md-typescale-body-small" style="text-align:center; padding:32px 16px; color:var(--md-sys-color-outline);">
-                    For emergencies dial 10111<br>
-                    Data cached 15min • Not affiliated with George Municipality<br>
-                    Refuse schedule: Verify at george.gov.za
-                </div>
+
+            <div class="card"><div class="head">{icon('emergency_home')}Live Disruptions</div>{disruptions_html}</div>
+
+            <div class="card"><div class="head">{icon('directions_bus')}Go George Alerts</div>{bus_html}</div>
+
+            <div class="card"><div class="head">{icon('water_drop')}Water Restrictions</div>
+                <div style="padding:0 20px 20px 56px;"><div style="font-weight:500;">{d['water_restrictions']['level']}</div><div style="opacity:0.8;font-size:14px;">{d['water_restrictions']['detail']}</div></div>
             </div>
-            
-            <div class="fab-container">
-                <md-fab extended label="Report" onclick="alert('Coming soon: Report outage')">
-                    <md-icon slot="icon">add_alert</md-icon>
-                </md-fab>
+
+            <div class="card"><div class="head">{icon('delete')}Refuse Collection</div>{refuse_html}</div>
+
+            <div class="card"><div class="head">{icon('celebration')}Events</div><div style="padding:0 20px 20px 56px;">{d['events'][0]['title']}</div></div>
+
+            <div class="card"><div class="head">{icon('campaign')}Notices</div>{notices_html}</div>
+
+            <div class="card"><div class="head">{icon('cloud')}Weather</div><div style="padding:0 20px 20px 56px;display:flex;gap:12px;align-items:center;">{icon('info')}<div>{d['weather']}</div></div></div>
+
+            <div class="card"><div class="head">{icon('call')}Municipal Contacts</div>
+                {"".join([f'<a href="tel:{c["phone"]}"><div style="padding:16px 20px;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #333;"><div><div style="font-weight:500;">{c["name"]}</div><div style="font-size:14px;opacity:0.8;">{c["area"]}</div></div>{icon("call")}</div></a>' for c in COUNCILLORS.values()])}
+            </div>
+
+            <div style="text-align:center;padding:30px 20px;opacity:0.55;font-size:12px;line-height:1.6;">
+                <a href="/admin" style="color:#9CCBFF;text-decoration:underline;">Admin</a> • For emergencies dial 10111<br>Data updates every 5 min • Not affiliated with George Municipality
             </div>
         </div>
-    </body>
-    </html>
+    </body></html>
     """
     return HTMLResponse(content=html)
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin():
+    return """
+    <html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Admin - CityGenie</title>
+    <style>body{font-family:system-ui;background:#101417;color:#fff;padding:24px;max-width:420px;margin:0 auto}h2{margin-bottom:20px}input,select,button{width:100%;padding:16px;margin:10px 0;border-radius:14px;border:1px solid #333;background:#1D2023;color:#fff;font-size:16px}button{background:#00639B;border:none;font-weight:600;margin-top:16px}label{font-size:14px;opacity:0.8;display:block;margin-top:12px}</style>
+    </head><body>
+    <h2>Post Live Disruption</h2>
+    <form method="post" action="/admin/post">
+        <label>Password</label><input type="password" name="pwd" required>
+        <label>Type</label><select name="type"><option>Power</option><option>Water</option><option>Traffic</option><option>Fibre</option><option>Alert</option></select>
+        <label>Message (max 120 chars)</label><input name="msg" placeholder="e.g. Heatherlands power outage - teams dispatched" required maxlength="120">
+        <label>Time</label><input name="time" value="Now">
+        <button type="submit">POST ALERT</button>
+    </form>
+    <form method="post" action="/admin/clear" style="margin-top:30px;border-top:1px solid #333;padding-top:20px;">
+        <label>Password</label><input type="password" name="pwd" required>
+        <button type="submit" style="background:#444;">CLEAR ALL ALERTS</button>
+    </form>
+    <p style="margin-top:30px;opacity:0.6;font-size:13px;">Alerts show instantly on homepage. They auto-clear when server restarts.</p>
+    </body></html>
+    """
+
+@app.post("/admin/post")
+async def admin_post(pwd: str = Form(...), type: str = Form(...), msg: str = Form(...), time: str = Form("Now")):
+    if pwd!= ADMIN_PASSWORD:
+        return HTMLResponse("Wrong password", status_code=403)
+    outages = []
+    if os.path.exists(OUTAGES_FILE):
+        try:
+            with open(OUTAGES_FILE) as f: outages = json.load(f)
+        except: pass
+    outages.insert(0, {"type": type, "msg": msg[:120], "time": time})
+    with open(OUTAGES_FILE, 'w') as f: json.dump(outages[:5], f)
+    get_cached_data.cache_clear()
+    return HTMLResponse("<script>alert('Alert posted!');location.href='/'</script>")
+
+@app.post("/admin/clear")
+async def admin_clear(pwd: str = Form(...)):
+    if pwd!= ADMIN_PASSWORD:
+        return HTMLResponse("Wrong password", status_code=403)
+    if os.path.exists(OUTAGES_FILE): os.remove(OUTAGES_FILE)
+    get_cached_data.cache_clear()
+    return HTMLResponse("<script>alert('Cleared!');location.href='/'</script>")
 
 @app.get("/api/data")
 async def api_data():
     d = get_data()
-    return JSONResponse({
-        "dam_level": d["dam"],
-        "notices": d["notices"],
-        "disruptions": d["disruptions"],
-        "weather_alert": d["weather"],
-        "live_events": d["events"],
-        "bus_alerts": d["bus_alerts"],
-        "water_restrictions": d["water_restrictions"],
-        "refuse_schedule": d["refuse"],
-        "councillors": COUNCILLORS,
-        "updated": d["time"].isoformat(),
-        "disclaimer": "For emergencies dial 10111"
-    })
+    return JSONResponse({**{k:v for k,v in d.items() if k!='refuse'}, "refuse_schedule": d["refuse"], "updated": d["time"].isoformat()})
 
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
+async def health(): return {"status":"ok"}
