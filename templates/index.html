@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#1a73e8">
+    <link rel="manifest" href="/manifest.json">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <title>CityGenie George</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 16px; }
+        h1 { font-size: 24px; margin: 0 0 16px 0; }
+      .card { background: #1e293b; border-radius: 12px; padding: 16px; margin-bottom: 12px; }
+      .big-num { font-size: 48px; font-weight: 700; color: #38bdf8; }
+      .label { font-size: 14px; color: #94a3b8; }
+        ul { padding-left: 20px; margin: 8px 0 0 0; }
+        li { margin-bottom: 6px; }
+    </style>
+</head>
+<body>
+    <h1>George Municipality</h1>
+    <div class="card">
+        <div class="label">Garden Route Dam</div>
+        <div class="big-num" id="dam">{{ data.dam_level }}%</div>
+        <div class="label">Updated: <span id="time">--:--</span></div>
+    </div>
+    <div class="card">
+        <div class="label">Power Outages Today</div>
+        <ul>{% for outage in data.outages %}<li>{{ outage }}</li>{% endfor %}</ul>
+    </div>
+    <div class="card">
+        <div class="label">Municipal Events</div>
+        <ul>{% for event in data.events %}<li>{{ event }}</li>{% endfor %}</ul>
+    </div>
+    <script>
+        const evtSource = new EventSource("/stream");
+        evtSource.onmessage = function(e) {
+            const data = JSON.parse(e.data);
+            document.getElementById('dam').innerText = data.dam_level + '%';
+            document.getElementById('time').innerText = data.time;
+        };
+    </script>
+</body>
+</html>
